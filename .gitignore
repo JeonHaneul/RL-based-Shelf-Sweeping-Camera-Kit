@@ -1,0 +1,16 @@
+# colcon output
+/build/
+/install/
+/log/
+
+# Developer tools and SDK-generated device state
+__pycache__/
+*.pyc
+.vscode/
+persist.json
+
+# Locally installed LUCID software
+ArenaSDK*/
+ArenaViewMP*/
+*.deb
+*.run
