@@ -1,0 +1,20 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>lucid_camera_node</name>
+  <version>0.0.1</version>
+  <description>Helios2 point clouds and Triton images for UR5e shelf-sweeping perception.</description>
+  <maintainer email="76903862+JeonHaneul@users.noreply.github.com">Haneul Jeon</maintainer>
+  <license>Unspecified in upstream source</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <depend>ament_index_cpp</depend>
+  <depend>cv_bridge</depend>
+  <depend>libopencv-dev</depend>
+  <depend>rclcpp</depend>
+  <depend>sensor_msgs</depend>
+  <depend>std_msgs</depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

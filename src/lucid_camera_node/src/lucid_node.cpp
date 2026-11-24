@@ -1,0 +1,564 @@
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <functional>
+#include <memory>
+#include <string>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <atomic>
+#include <queue>
+#include <stdexcept>
+#include <tuple>
+#include <utility>
+#include <vector>
+
+#include "ArenaApi.h"
+#include <opencv2/core.hpp>
+#include <opencv2/calib3d.hpp>
+
+#include "ament_index_cpp/get_package_share_directory.hpp"
+#include "rclcpp/rclcpp.hpp"
+#include "std_msgs/msg/header.hpp"
+#include "sensor_msgs/msg/image.hpp"
+#include "sensor_msgs/msg/camera_info.hpp"
+#include "sensor_msgs/msg/point_cloud2.hpp"
+#include "sensor_msgs/point_cloud2_iterator.hpp"
+#include "cv_bridge/cv_bridge.h"
+
+using namespace std::chrono_literals;
+
+#define TIMEOUT 200
+
+// Return any acquired buffer even if the second camera times out.
+struct ReturnBuffer
+{
+    Arena::IDevice* device;
+    void operator()(Arena::IImage* image) const noexcept
+    {
+        try { device->RequeueBuffer(image); }
+        catch (const GenICam::GenericException& e) {
+            RCLCPP_ERROR(rclcpp::get_logger("lucid_camera_node"), "Returning Arena buffer: %s", e.what());
+        }
+    }
+};
+using ImageBuffer = std::unique_ptr<Arena::IImage, ReturnBuffer>;
+
+bool isApplicableDeviceTriton(Arena::DeviceInfo deviceInfo)
+{
+    return ((deviceInfo.ModelName().find("TRI") != GenICam::gcstring::npos) && (deviceInfo.ModelName().find("-C") != GenICam::gcstring::npos));
+}
+
+bool isApplicableDeviceHelios2(Arena::DeviceInfo deviceInfo)
+{
+    return ((deviceInfo.ModelName().find("HLT") != GenICam::gcstring::npos) || (deviceInfo.ModelName().find("HT") != GenICam::gcstring::npos));
+}
+
+// 포인트클라우드 처리용 데이터 구조체
+struct PointCloudData
+{
+    cv::Mat imageMatrixXYZ;
+    cv::Mat imageMatrixRGB;
+    rclcpp::Time timestamp;
+};
+
+class MinimalPublisher : public rclcpp::Node
+{
+public:
+    MinimalPublisher()
+    : Node("lucid_camera_node"), pSystem_(nullptr), pDeviceTRI_(nullptr), pDeviceHLT_(nullptr),
+      running_(true)
+    {
+        image_publisher_ = this->create_publisher<sensor_msgs::msg::Image>("triton/image_raw", 10);
+        camera_info_publisher_ = this->create_publisher<sensor_msgs::msg::CameraInfo>("triton/camera_info", 10);
+        pointcloud_publisher_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("helios/pointcloud_rgb", 10);
+
+        try
+        {
+            const auto directory =
+                ament_index_cpp::get_package_share_directory("lucid_camera_node") + "/calibration/";
+            loadCalibrationData(declare_parameter<std::string>("orientation_file", directory + "orientation.yml"));
+            loadTritonCalibrationData(declare_parameter<std::string>("intrinsics_file", directory + "tritoncalibration.yml"));
+
+            pSystem_ = Arena::OpenSystem();
+            pSystem_->UpdateDevices(100);
+            std::vector<Arena::DeviceInfo> deviceInfos = pSystem_->GetDevices();
+            if (deviceInfos.size() == 0)
+            {
+                RCLCPP_ERROR(this->get_logger(), "No camera connected");
+                Arena::CloseSystem(pSystem_);
+                pSystem_ = nullptr;
+                throw std::runtime_error("No camera connected");
+            }
+
+            for (auto& deviceInfo : deviceInfos)
+            {
+                if (!pDeviceTRI_ && isApplicableDeviceTriton(deviceInfo))
+                {
+                    pDeviceTRI_ = pSystem_->CreateDevice(deviceInfo);
+                    RCLCPP_INFO(this->get_logger(), "Found Triton camera: %s", deviceInfo.ModelName().c_str());
+
+                    Arena::SetNodeValue<bool>(pDeviceTRI_->GetTLStreamNodeMap(), "StreamAutoNegotiatePacketSize", true);
+                    Arena::SetNodeValue<bool>(pDeviceTRI_->GetTLStreamNodeMap(), "StreamPacketResendEnable", true);
+
+                    #if defined(__linux__)
+                        Arena::SetNodeValue<GenICam::gcstring>(pDeviceTRI_->GetNodeMap(), "PixelFormat", "BGR8");
+                    #else
+                        Arena::SetNodeValue<GenICam::gcstring>(pDeviceTRI_->GetNodeMap(), "PixelFormat", "RGB8");
+                    #endif
+                }
+                else if (!pDeviceHLT_ && isApplicableDeviceHelios2(deviceInfo))
+                {
+                    pDeviceHLT_ = pSystem_->CreateDevice(deviceInfo);
+                    auto pNodeMapHLT = pDeviceHLT_->GetNodeMap();
+
+                    // 1. 펌웨어 호환성 체크 (Scan3dCoordinateOffset 노드 존재 여부)
+                    GenApi::CFloatPtr checkpCoord = pNodeMapHLT->GetNode("Scan3dCoordinateOffset");
+                    if (!checkpCoord)
+                    {
+                        RCLCPP_ERROR(this->get_logger(), "Scan3dCoordinateOffset node not found. Please update Helios firmware!");
+                        // 필요 시 여기서 return 하거나 예외를 던질 수 있습니다.
+                    }
+
+                    // 2. 모델 식별 (Helios2 여부 확인)
+                    bool isHelios2 = false;
+                    GenICam::gcstring modelName = Arena::GetNodeValue<GenICam::gcstring>(pNodeMapHLT, "DeviceModelName");
+                    std::string modelStr = modelName.c_str();
+                    if (modelStr.rfind("HLT", 0) == 0 || modelStr.rfind("HT", 0) == 0)
+                    {
+                        isHelios2 = true;
+                    }
+
+                    // 3. Pixel Format 설정
+                    Arena::SetNodeValue<GenICam::gcstring>(pNodeMapHLT, "PixelFormat", "Coord3D_ABCY16");
+
+                    // 4. 동작 모드 설정 (와인잔 측정을 위한 HDR 모드 권장)
+                    if (isHelios2)
+                    {
+                        // 와인잔과 같은 투명/반사체는 'Distance1500mmHDR'이 가장 정밀합니다.
+                        // 보내주신 코드의 'Distance3000mmSingleFreq'보다 HDR 모드가 유리할 수 있습니다.
+                        RCLCPP_INFO(this->get_logger(), "Setting Helios2 to Distance8300mmMultiFreq.");
+                        Arena::SetNodeValue<GenICam::gcstring>(pNodeMapHLT, "Scan3dOperatingMode", "Distance8300mmMultiFreq");
+                    }
+                    else
+                    {
+                        RCLCPP_INFO(this->get_logger(), "Standard Helios detected. Setting 1500mm Mode.");
+                        Arena::SetNodeValue<GenICam::gcstring>(pNodeMapHLT, "Scan3dOperatingMode", "Distance1500mm");
+                    }
+                }
+            }
+
+            if (!pDeviceTRI_)
+            {
+                RCLCPP_ERROR(this->get_logger(), "No applicable Triton devices found");
+                cleanup();
+                throw std::logic_error("No applicable Triton devices");
+            }
+
+            if (!pDeviceHLT_)
+            {
+                RCLCPP_ERROR(this->get_logger(), "No applicable Helios2 devices found");
+                cleanup();
+                throw std::logic_error("No applicable Helios2 devices");
+            }
+
+            GenApi::INodeMap* node_map = pDeviceHLT_->GetNodeMap();
+            xyz_scale_mm_ = Arena::GetNodeValue<double>(node_map, "Scan3dCoordinateScale");
+            Arena::SetNodeValue<GenICam::gcstring>(node_map, "Scan3dCoordinateSelector", "CoordinateA");
+            x_offset_mm_ = Arena::GetNodeValue<double>(node_map, "Scan3dCoordinateOffset");
+            Arena::SetNodeValue<GenICam::gcstring>(node_map, "Scan3dCoordinateSelector", "CoordinateB");
+            y_offset_mm_ = Arena::GetNodeValue<double>(node_map, "Scan3dCoordinateOffset");
+            Arena::SetNodeValue<GenICam::gcstring>(node_map, "Scan3dCoordinateSelector", "CoordinateC");
+            z_offset_mm_ = Arena::GetNodeValue<double>(node_map, "Scan3dCoordinateOffset");
+
+            pDeviceTRI_->StartStream();
+            pDeviceHLT_->StartStream();
+            RCLCPP_INFO(this->get_logger(), "Started streaming from both cameras");
+
+            // 포인트클라우드 처리 스레드 시작
+
+            // 이미지 캡처 타이머 (30Hz - 이미지만)
+            timer_ = this->create_wall_timer(
+                33ms, std::bind(&MinimalPublisher::timer_callback, this));
+            pointcloud_thread_ = std::thread(&MinimalPublisher::pointcloud_processing_thread, this);
+        }
+        catch (GenICam::GenericException& ge)
+        {
+            RCLCPP_ERROR(this->get_logger(), "GenICam exception: %s", ge.what());
+            cleanup();
+            throw;
+        }
+        catch (std::exception& ex)
+        {
+            RCLCPP_ERROR(this->get_logger(), "Standard exception: %s", ex.what());
+            cleanup();
+            throw;
+        }
+    }
+
+    ~MinimalPublisher()
+    {
+        {
+            std::lock_guard<std::mutex> lock(queue_mutex_);
+            running_ = false;
+        }
+        cv_.notify_all();
+
+        if (pointcloud_thread_.joinable())
+        {
+            pointcloud_thread_.join();
+        }
+
+        cleanup();
+    }
+
+private:
+    void loadCalibrationData(const std::string& path)
+    {
+        cv::FileStorage fs(path, cv::FileStorage::READ);
+        if (!fs.isOpened())
+        {
+            RCLCPP_ERROR(this->get_logger(), "Failed to open calibration file: %s", path.c_str());
+            throw std::runtime_error("Calibration file not found");
+        }
+
+        fs["cameraMatrix"] >> cameraMatrix_;
+        fs["distCoeffs"] >> distCoeffs_;
+        fs["rotationVector"] >> rotationVector_;
+        fs["translationVector"] >> translationVector_;
+        fs.release();
+
+        validateIntrinsics(cameraMatrix_, distCoeffs_, path);
+        if (!isVector(rotationVector_, 3) || !isVector(translationVector_, 3))
+            throw std::runtime_error("Invalid rotationVector or translationVector in " + path);
+        RCLCPP_INFO(this->get_logger(), "Loaded registration data from %s", path.c_str());
+    }
+
+    static bool isVector(const cv::Mat& value, size_t length)
+    {
+        return value.channels() == 1 && (value.rows == 1 || value.cols == 1) &&
+               value.total() == length && (value.depth() == CV_32F || value.depth() == CV_64F) &&
+               cv::checkRange(value);
+    }
+
+    static void validateIntrinsics(cv::Mat& matrix, cv::Mat& distortion, const std::string& path)
+    {
+        const auto n = distortion.total();
+        if (matrix.rows != 3 || matrix.cols != 3 || matrix.channels() != 1 ||
+            (matrix.depth() != CV_32F && matrix.depth() != CV_64F) || !cv::checkRange(matrix) ||
+            !(n == 4 || n == 5 || n == 8 || n == 12 || n == 14) || !isVector(distortion, n))
+            throw std::runtime_error("Invalid cameraMatrix or distCoeffs in " + path);
+        matrix.convertTo(matrix, CV_64F);
+        distortion.convertTo(distortion, CV_64F);
+        distortion = distortion.reshape(1, static_cast<int>(n));
+    }
+
+    void loadTritonCalibrationData(const std::string& path)
+    {
+        cv::FileStorage fs(path, cv::FileStorage::READ);
+        if (!fs.isOpened())
+        {
+            RCLCPP_ERROR(this->get_logger(), "Failed to open Triton calibration file: %s", path.c_str());
+            throw std::runtime_error("Triton calibration file not found");
+        }
+
+        fs["cameraMatrix"] >> tritonCameraMatrix_;
+        fs["distCoeffs"] >> tritonDistCoeffs_;
+        fs.release();
+
+        validateIntrinsics(tritonCameraMatrix_, tritonDistCoeffs_, path);
+        RCLCPP_INFO(this->get_logger(), "Loaded Triton intrinsics from %s", path.c_str());
+    }
+
+    // 이미지 캡처 및 publish (메인 스레드)
+    void timer_callback()
+    {
+        if (!pDeviceTRI_ || !pDeviceHLT_) return;
+
+        try
+        {
+            ImageBuffer pImageHLT(pDeviceHLT_->GetImage(TIMEOUT), ReturnBuffer{pDeviceHLT_});
+            ImageBuffer pImageTRI(pDeviceTRI_->GetImage(TIMEOUT), ReturnBuffer{pDeviceTRI_});
+
+            rclcpp::Time capture_time = this->now();
+            if (pImageHLT && pImageTRI)
+            {
+                size_t hlt_width = pImageHLT->GetWidth();
+                size_t hlt_height = pImageHLT->GetHeight();
+
+                cv::Mat imageMatrixXYZ((int)hlt_height, (int)hlt_width, CV_32FC3);
+                const uint16_t* input_data = reinterpret_cast<const uint16_t*>(pImageHLT->GetData());
+
+                for (unsigned int ir = 0; ir < hlt_height; ++ir)
+                {
+                    for (unsigned int ic = 0; ic < hlt_width; ++ic)
+                    {
+                        ushort x_u16 = input_data[0];
+                        ushort y_u16 = input_data[1];
+                        ushort z_u16 = input_data[2];
+
+                        imageMatrixXYZ.at<cv::Vec3f>(ir, ic)[0] = (float)(x_u16 * xyz_scale_mm_ + x_offset_mm_);
+                        imageMatrixXYZ.at<cv::Vec3f>(ir, ic)[1] = (float)(y_u16 * xyz_scale_mm_ + y_offset_mm_);
+                        imageMatrixXYZ.at<cv::Vec3f>(ir, ic)[2] = (float)(z_u16 * xyz_scale_mm_ + z_offset_mm_);
+
+                        input_data += 4;
+                    }
+                }
+
+                size_t tri_width = pImageTRI->GetWidth();
+                size_t tri_height = pImageTRI->GetHeight();
+                cv::Mat imageMatrixRGB((int)tri_height, (int)tri_width, CV_8UC3);
+                memcpy(imageMatrixRGB.data, pImageTRI->GetData(), tri_height * tri_width * 3);
+
+                // 이미지 즉시 publish (빠름)
+                std_msgs::msg::Header header;
+                header.stamp = capture_time;
+                header.frame_id = "triton_camera";
+                auto ros_image = cv_bridge::CvImage(header, "bgr8", imageMatrixRGB).toImageMsg();
+                image_publisher_->publish(*ros_image);
+
+                // CameraInfo publish
+                sensor_msgs::msg::CameraInfo cam_info_msg;
+                cam_info_msg.header = header;
+                cam_info_msg.height = tri_height;
+                cam_info_msg.width = tri_width;
+                cam_info_msg.distortion_model = "rational_polynomial";
+
+                // D (distortion coefficients)
+                cam_info_msg.d.resize(tritonDistCoeffs_.rows * tritonDistCoeffs_.cols);
+                for (int i = 0; i < tritonDistCoeffs_.rows * tritonDistCoeffs_.cols; i++)
+                    cam_info_msg.d[i] = tritonDistCoeffs_.at<double>(i);
+
+                // K (3x3 intrinsic camera matrix)
+                for (int i = 0; i < 9; i++)
+                    cam_info_msg.k[i] = tritonCameraMatrix_.at<double>(i / 3, i % 3);
+
+                // R (3x3 identity rotation matrix)
+                cam_info_msg.r = {1.0, 0.0, 0.0,
+                                  0.0, 1.0, 0.0,
+                                  0.0, 0.0, 1.0};
+
+                // P (3x4 projection matrix)
+                double fx = tritonCameraMatrix_.at<double>(0, 0);
+                double fy = tritonCameraMatrix_.at<double>(1, 1);
+                double cx = tritonCameraMatrix_.at<double>(0, 2);
+                double cy = tritonCameraMatrix_.at<double>(1, 2);
+                cam_info_msg.p = {fx, 0.0, cx, 0.0,
+                                  0.0, fy, cy, 0.0,
+                                  0.0, 0.0, 1.0, 0.0};
+
+                camera_info_publisher_->publish(cam_info_msg);
+
+                // 포인트클라우드 데이터를 큐에 추가 (별도 스레드에서 처리)
+                {
+                    std::lock_guard<std::mutex> lock(queue_mutex_);
+
+                    // 큐가 너무 커지면 오래된 데이터 제거
+                    while (pointcloud_queue_.size() >= 3)
+                    {
+                        pointcloud_queue_.pop();
+                    }
+
+                    PointCloudData data;
+                    data.imageMatrixXYZ = imageMatrixXYZ.clone();
+                    data.imageMatrixRGB = imageMatrixRGB.clone();
+                    data.timestamp = capture_time;
+                    pointcloud_queue_.push(std::move(data));
+                }
+                cv_.notify_one();
+
+            }
+        }
+        catch (GenICam::GenericException& ge)
+        {
+            RCLCPP_ERROR(this->get_logger(), "Error capturing image: %s", ge.what());
+        }
+    }
+
+    // 포인트클라우드 처리 스레드 (별도 스레드)
+    void pointcloud_processing_thread()
+    {
+        while (running_)
+        {
+            PointCloudData data;
+
+            {
+                std::unique_lock<std::mutex> lock(queue_mutex_);
+                cv_.wait(lock, [this] { return !pointcloud_queue_.empty() || !running_; });
+
+                if (!running_) break;
+
+                data = std::move(pointcloud_queue_.front());
+                pointcloud_queue_.pop();
+            }
+
+            // 포인트클라우드 처리 (시간 소요)
+            process_and_publish_pointcloud(data);
+        }
+    }
+
+    void process_and_publish_pointcloud(const PointCloudData& data)
+    {
+        size_t hlt_width = data.imageMatrixXYZ.cols;
+        size_t hlt_height = data.imageMatrixXYZ.rows;
+
+        int size = data.imageMatrixXYZ.rows * data.imageMatrixXYZ.cols;
+        cv::Mat xyzPoints = data.imageMatrixXYZ.reshape(3, size);
+
+        cv::Mat projectedPointsTRI;
+        cv::projectPoints(
+            xyzPoints,
+            rotationVector_,
+            translationVector_,
+            cameraMatrix_,
+            distCoeffs_,
+            projectedPointsTRI);
+
+        sensor_msgs::msg::PointCloud2 cloud_msg;
+        cloud_msg.header.stamp = data.timestamp;
+        cloud_msg.header.frame_id = "helios_camera";
+        cloud_msg.height = 1;
+        cloud_msg.is_dense = false;
+        cloud_msg.is_bigendian = false;
+
+        std::vector<std::tuple<float, float, float, uint8_t, uint8_t, uint8_t>> valid_points;
+        valid_points.reserve(hlt_width * hlt_height);
+
+        for (int i = 0; i < static_cast<int>(hlt_width * hlt_height); i++)
+        {
+            float X = data.imageMatrixXYZ.at<cv::Vec3f>(i / hlt_width, i % hlt_width)[0];
+            float Y = data.imageMatrixXYZ.at<cv::Vec3f>(i / hlt_width, i % hlt_width)[1];
+            float Z = data.imageMatrixXYZ.at<cv::Vec3f>(i / hlt_width, i % hlt_width)[2];
+
+            if (Z <= 0) continue;
+
+            float projX = projectedPointsTRI.at<cv::Vec2f>(i, 0)[0];
+            float projY = projectedPointsTRI.at<cv::Vec2f>(i, 0)[1];
+
+            const float row = std::round(projY);
+            const float col = std::round(projX);
+            if (!(row >= 0 && row < data.imageMatrixRGB.rows &&
+                  col >= 0 && col < data.imageMatrixRGB.cols))
+                continue;
+            const int rowTRI = static_cast<int>(row);
+            const int colTRI = static_cast<int>(col);
+
+            uint8_t R = data.imageMatrixRGB.at<cv::Vec3b>(rowTRI, colTRI)[2];
+            uint8_t G = data.imageMatrixRGB.at<cv::Vec3b>(rowTRI, colTRI)[1];
+            uint8_t B = data.imageMatrixRGB.at<cv::Vec3b>(rowTRI, colTRI)[0];
+
+            valid_points.emplace_back(X / 1000.0f, Y / 1000.0f, Z / 1000.0f, R, G, B);
+        }
+
+        cloud_msg.width = valid_points.size();
+
+        sensor_msgs::PointCloud2Modifier modifier(cloud_msg);
+        modifier.setPointCloud2Fields(
+            5,
+            "x", 1, sensor_msgs::msg::PointField::FLOAT32,
+            "y", 1, sensor_msgs::msg::PointField::FLOAT32,
+            "z", 1, sensor_msgs::msg::PointField::FLOAT32,
+            "rgb", 1, sensor_msgs::msg::PointField::UINT32,
+            "intensity", 1, sensor_msgs::msg::PointField::FLOAT32
+        );
+        modifier.resize(valid_points.size());
+        if (valid_points.empty())
+        {
+            pointcloud_publisher_->publish(cloud_msg);
+            return;
+        }
+
+        sensor_msgs::PointCloud2Iterator<float> iter_x(cloud_msg, "x");
+        sensor_msgs::PointCloud2Iterator<float> iter_y(cloud_msg, "y");
+        sensor_msgs::PointCloud2Iterator<float> iter_z(cloud_msg, "z");
+        sensor_msgs::PointCloud2Iterator<uint8_t> iter_rgb(cloud_msg, "rgb");
+        sensor_msgs::PointCloud2Iterator<float> iter_intensity(cloud_msg, "intensity");
+
+        for (const auto& pt : valid_points)
+        {
+            *iter_x = std::get<0>(pt);
+            *iter_y = std::get<1>(pt);
+            *iter_z = std::get<2>(pt);
+
+            iter_rgb[0] = std::get<5>(pt);
+            iter_rgb[1] = std::get<4>(pt);
+            iter_rgb[2] = std::get<3>(pt);
+            iter_rgb[3] = 255;
+
+            *iter_intensity = 0.5f;
+
+            ++iter_x; ++iter_y; ++iter_z; ++iter_rgb; ++iter_intensity;
+        }
+
+        pointcloud_publisher_->publish(cloud_msg);
+
+        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+                             "Publishing pointcloud with %zu points", valid_points.size());
+    }
+
+    void cleanup()
+    {
+        try
+        {
+            if (pDeviceTRI_)
+            {
+                pDeviceTRI_->StopStream();
+                pSystem_->DestroyDevice(pDeviceTRI_);
+                pDeviceTRI_ = nullptr;
+            }
+            if (pDeviceHLT_)
+            {
+                pDeviceHLT_->StopStream();
+                pSystem_->DestroyDevice(pDeviceHLT_);
+                pDeviceHLT_ = nullptr;
+            }
+            if (pSystem_)
+            {
+                Arena::CloseSystem(pSystem_);
+                pSystem_ = nullptr;
+            }
+        }
+        catch (...)
+        {
+        }
+    }
+
+    rclcpp::TimerBase::SharedPtr timer_;
+    rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr image_publisher_;
+    rclcpp::Publisher<sensor_msgs::msg::CameraInfo>::SharedPtr camera_info_publisher_;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pointcloud_publisher_;
+
+    Arena::ISystem* pSystem_;
+    Arena::IDevice* pDeviceTRI_;
+    Arena::IDevice* pDeviceHLT_;
+
+    cv::Mat cameraMatrix_;
+    cv::Mat distCoeffs_;
+    cv::Mat rotationVector_;
+    cv::Mat translationVector_;
+
+    cv::Mat tritonCameraMatrix_;
+    cv::Mat tritonDistCoeffs_;
+
+    double xyz_scale_mm_;
+    double x_offset_mm_;
+    double y_offset_mm_;
+    double z_offset_mm_;
+
+    // 멀티스레드용 멤버
+    std::thread pointcloud_thread_;
+    std::mutex queue_mutex_;
+    std::condition_variable cv_;
+    std::queue<PointCloudData> pointcloud_queue_;
+    std::atomic<bool> running_;
+};
+
+int main(int argc, char * argv[])
+{
+    rclcpp::init(argc, argv);
+    rclcpp::spin(std::make_shared<MinimalPublisher>());
+    rclcpp::shutdown();
+    return 0;
+}
